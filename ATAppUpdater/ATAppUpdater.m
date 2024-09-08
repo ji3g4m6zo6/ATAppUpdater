@@ -111,11 +111,15 @@
 - (BOOL)hasConnection
 {
     const char *host = "itunes.apple.com";
-    BOOL reachable;
+    BOOL reachable = NO;
     BOOL success;
     
     // Link SystemConfiguration.framework! <SystemConfiguration/SystemConfiguration.h>
     SCNetworkReachabilityRef reachability = SCNetworkReachabilityCreateWithName(NULL, host);
+    if (reachability == NULL) {
+        return NO; // 如果 reachability 是 NULL，直接返回 NO，避免後續崩潰
+    }
+    
     SCNetworkReachabilityFlags flags;
     success = SCNetworkReachabilityGetFlags(reachability, &flags);
     reachable = success && (flags & kSCNetworkFlagsReachable) && !(flags & kSCNetworkFlagsConnectionRequired);
@@ -127,83 +131,97 @@ NSString *appStoreURL = nil;
 
 - (void)checkNewAppVersion:(void(^)(BOOL newVersion, NSString *version))completion
 {
-    NSDictionary *bundleInfo = [[NSBundle mainBundle] infoDictionary];
-    NSString *bundleIdentifier = bundleInfo[@"CFBundleIdentifier"];
-    NSString *currentVersion = bundleInfo[@"CFBundleShortVersionString"];
-    
-    NSLocale *currentLocale = [NSLocale currentLocale];
-    NSString *countryCode = [currentLocale objectForKey:NSLocaleCountryCode];
-    NSURL *lookupURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&t=%f&country=%@",
-                                             bundleIdentifier, [NSDate.date timeIntervalSince1970],countryCode]];
-    
-    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(void) {
+    @try {
+        NSDictionary *bundleInfo = [[NSBundle mainBundle] infoDictionary];
+        NSString *bundleIdentifier = bundleInfo[@"CFBundleIdentifier"];
+        NSString *currentVersion = bundleInfo[@"CFBundleShortVersionString"];
         
-        NSData *lookupResults = [NSData dataWithContentsOfURL:lookupURL];
-        if (!lookupResults) {
-            completion(NO, nil);
-            return;
-        }
+        NSLocale *currentLocale = [NSLocale currentLocale];
+        NSString *countryCode = [currentLocale objectForKey:NSLocaleCountryCode];
+        NSURL *lookupURL = [NSURL URLWithString:[NSString stringWithFormat:@"https://itunes.apple.com/lookup?bundleId=%@&t=%f&country=%@",
+                                                 bundleIdentifier, [NSDate.date timeIntervalSince1970], countryCode]];
         
-        NSDictionary *jsonResults = [NSJSONSerialization JSONObjectWithData:lookupResults options:0 error:nil];
-        
-        dispatch_async(dispatch_get_main_queue(), ^(void) {
-            NSUInteger resultCount = [jsonResults[@"resultCount"] integerValue];
-            if (resultCount){
-                NSDictionary *appDetails = [jsonResults[@"results"] firstObject];
-                NSString *appItunesUrl = [appDetails[@"trackViewUrl"] stringByReplacingOccurrencesOfString:@"&uo=4" withString:@""];
-                NSString *latestVersion = appDetails[@"version"];
-                if ([latestVersion compare:currentVersion options:NSNumericSearch] == NSOrderedDescending) {
-                    appStoreURL = appItunesUrl;
-                    completion(YES, latestVersion);
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(void) {
+            
+            NSData *lookupResults = [NSData dataWithContentsOfURL:lookupURL];
+            if (!lookupResults) {
+                completion(NO, nil);
+                return;
+            }
+            
+            NSError *jsonError = nil;
+            NSDictionary *jsonResults = [NSJSONSerialization JSONObjectWithData:lookupResults options:0 error:&jsonError];
+            if (jsonError || !jsonResults) {
+                completion(NO, nil);
+                return;
+            }
+            
+            dispatch_async(dispatch_get_main_queue(), ^(void) {
+                NSUInteger resultCount = [jsonResults[@"resultCount"] integerValue];
+                if (resultCount){
+                    NSDictionary *appDetails = [jsonResults[@"results"] firstObject];
+                    NSString *appItunesUrl = [appDetails[@"trackViewUrl"] stringByReplacingOccurrencesOfString:@"&uo=4" withString:@""];
+                    NSString *latestVersion = appDetails[@"version"];
+                    if ([latestVersion compare:currentVersion options:NSNumericSearch] == NSOrderedDescending) {
+                        appStoreURL = appItunesUrl;
+                        completion(YES, latestVersion);
+                    } else {
+                        completion(NO, nil);
+                    }
                 } else {
                     completion(NO, nil);
                 }
-            } else {
-                completion(NO, nil);
-            }
+            });
         });
-    });
+    } @catch (NSException *exception) {
+        completion(NO, nil); // 如果發生異常，忽略並回傳 NO
+    }
 }
 
 - (void)alertUpdateForVersion:(NSString *)version withForce:(BOOL)force
 {
-    NSString *alertMessage = [NSString stringWithFormat:self.alertMessage, version];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:self.alertTitle message:alertMessage preferredStyle:UIAlertControllerStyleAlert];
-    
-    UIAlertAction *updateAction = [UIAlertAction actionWithTitle:self.alertUpdateButtonTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
-        [[UIApplication sharedApplication] openURL:[NSURL URLWithString:appStoreURL]];
-        if ([self.delegate respondsToSelector:@selector(appUpdaterUserDidLaunchAppStore)]) {
-            [self.delegate appUpdaterUserDidLaunchAppStore];
-        }
-    }];
-    [alert addAction:updateAction];
-    
-    if (!force) {
-        UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:self.alertCancelButtonTitle style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
-            if ([self.delegate respondsToSelector:@selector(appUpdaterUserDidCancel)]) {
-                [self.delegate appUpdaterUserDidCancel];
+    @try {
+        NSString *alertMessage = [NSString stringWithFormat:self.alertMessage, version];
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:self.alertTitle message:alertMessage preferredStyle:UIAlertControllerStyleAlert];
+        
+        UIAlertAction *updateAction = [UIAlertAction actionWithTitle:self.alertUpdateButtonTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
+            if (appStoreURL) {
+                [[UIApplication sharedApplication] openURL:[NSURL URLWithString:appStoreURL]];
+                if ([self.delegate respondsToSelector:@selector(appUpdaterUserDidLaunchAppStore)]) {
+                    [self.delegate appUpdaterUserDidLaunchAppStore];
+                }
             }
         }];
-        [alert addAction:cancelAction];
-    }
-    
-    UIWindow        *foundWindow = nil;
-    NSArray         *windows = [[UIApplication sharedApplication] windows];
-    
-    for (UIWindow   *window in windows) {
-        if (window.isKeyWindow) {
-            foundWindow = window;
-            break;
+        [alert addAction:updateAction];
+        
+        if (!force) {
+            UIAlertAction *cancelAction = [UIAlertAction actionWithTitle:self.alertCancelButtonTitle style:UIAlertActionStyleCancel handler:^(UIAlertAction * _Nonnull action) {
+                if ([self.delegate respondsToSelector:@selector(appUpdaterUserDidCancel)]) {
+                    [self.delegate appUpdaterUserDidCancel];
+                }
+            }];
+            [alert addAction:cancelAction];
         }
-    }
-    
-    if (foundWindow)
-    {
-        [foundWindow.rootViewController presentViewController:alert animated:YES completion:^{
-            if ([self.delegate respondsToSelector:@selector(appUpdaterDidShowUpdateDialog)]) {
-                [self.delegate appUpdaterDidShowUpdateDialog];
+        
+        UIWindow        *foundWindow = nil;
+        NSArray         *windows = [[UIApplication sharedApplication] windows];
+        
+        for (UIWindow   *window in windows) {
+            if (window.isKeyWindow) {
+                foundWindow = window;
+                break;
             }
-        }];
+        }
+        
+        if (foundWindow.rootViewController) {
+            [foundWindow.rootViewController presentViewController:alert animated:YES completion:^{
+                if ([self.delegate respondsToSelector:@selector(appUpdaterDidShowUpdateDialog)]) {
+                    [self.delegate appUpdaterDidShowUpdateDialog];
+                }
+            }];
+        }
+    } @catch (NSException *exception) {
+        // 忽略任何異常，不顯示更新提醒
     }
 }
 
